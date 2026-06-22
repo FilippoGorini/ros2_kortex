@@ -70,10 +70,12 @@ enum class StopStartInterface
   STOP_POS_VEL,
   STOP_TWIST,
   STOP_GRIPPER,
+  STOP_GRIPPER_VEL,
   STOP_FAULT_CTRL,
   START_POS_VEL,
   START_TWIST,
   START_GRIPPER,
+  START_GRIPPER_VEL,
   START_FAULT_CTRL,
 };
 class KortexMultiInterfaceHardware : public hardware_interface::SystemInterface
@@ -151,6 +153,22 @@ private:
   double gripper_velocity_ = 0.0;
   double gripper_force_command_ = 0.0;
   double gripper_speed_command_ = 0.0;
+  // Signed gripper speed setpoint in [-1, 1] driven by the forward_command_controller ...
+  // ... on the gripper "velocity" command interface, used only in SINGLE_LEVEL_SERVOING mode
+  double gripper_velocity_command_ = 0.0;
+  // True while we are actively streaming a non-zero GRIPPER_SPEED command, so we ...
+  // ... know to emit exactly one zero-speed stop on release
+  bool gripper_motion_active_ = false;
+  // Below this magnitude the gripper velocity command is treated as no motion
+  static constexpr double GRIPPER_VEL_DEADBAND = 0.02;
+  // Twist is considered zero (arm still) when every component is below this
+  static constexpr double TWIST_ZERO_EPS = 1e-3;
+  // High-level twist has no firmware watchdog (TwistCommand duration is 0), so it
+  // runs until the next twist command. A zero twist must therefore be actively sent
+  // to stop the arm before a gripper RPC may take the shared high-level bus. Latches
+  // true once the zero (stop) twist has been delivered; reset to false whenever a
+  // non-zero twist goes out. Starts true (no motion to stop).
+  bool twist_stopped_ = true;
 
   rclcpp::Time controller_switch_time_;
   std::atomic<bool> block_write = false;
@@ -174,6 +192,7 @@ private:
   bool joint_based_controller_running_;
   bool twist_controller_running_;
   bool gripper_controller_running_;
+  bool gripper_vel_controller_running_ = false;
   bool fault_controller_running_;
   // switching auxiliary vars
   // keeping track of which controller is active so appropriate control mode can be adjusted
@@ -186,10 +205,12 @@ private:
   bool stop_joint_based_controller_;
   bool stop_twist_controller_;
   bool stop_gripper_controller_;
+  bool stop_gripper_vel_controller_ = false;
   bool stop_fault_controller_;
   bool start_joint_based_controller_;
   bool start_twist_controller_;
   bool start_gripper_controller_;
+  bool start_gripper_vel_controller_ = false;
   bool start_fault_controller_;
 
   // first pass flag
@@ -219,6 +240,13 @@ private:
   void prepareCommands();
   void sendGripperCommand(
     k_api::Base::ServoingMode arm_mode, double position, double velocity, double force);
+
+  // Send a high-level GRIPPER_SPEED command (signed speed in [-1, 1]).
+  void sendGripperSpeed(double speed);
+
+  // True when every twist command component is near zero, i.e. the arm is not
+  // being commanded to move
+  bool twistIsZero() const;
 
   void readGripperPosition();
 };

@@ -356,6 +356,14 @@ KortexMultiInterfaceHardware::export_command_interfaces()
       command_interfaces.emplace_back(hardware_interface::CommandInterface(
         info_.joints[i].name, "set_gripper_max_effort", &gripper_force_command_));
       gripper_force_command_ = gripper_command_max_force_;
+
+      // Signed gripper speed setpoint [-1, 1] for hold-to-move teleop, claimed by a
+      // forward_command_controller. Not declared in the URDF ros2_control block on
+      // purpose: like the "tcp/twist.*" and "set_gripper_*" interfaces above, this
+      // hardware exports its command interfaces programmatically.
+      command_interfaces.emplace_back(hardware_interface::CommandInterface(
+        info_.joints[i].name, hardware_interface::HW_IF_VELOCITY, &gripper_velocity_command_));
+      gripper_velocity_command_ = 0.0;
       RCLCPP_INFO(LOGGER, "Gripper max vel and effort configured");
     }
     else
@@ -406,9 +414,9 @@ return_type KortexMultiInterfaceHardware::prepare_command_mode_switch(
 
   // reset auxiliary switching booleans
   stop_joint_based_controller_ = stop_twist_controller_ = stop_fault_controller_ =
-    stop_gripper_controller_ = false;
+    stop_gripper_controller_ = stop_gripper_vel_controller_ = false;
   start_joint_based_controller_ = start_twist_controller_ = start_fault_controller_ =
-    start_gripper_controller_ = false;
+    start_gripper_controller_ = start_gripper_vel_controller_ = false;
 
   // sleep to ensure all outgoing write commands have finished
   block_write = true;
@@ -434,6 +442,8 @@ return_type KortexMultiInterfaceHardware::prepare_command_mode_switch(
         key == joint.name + "/" + hardware_interface::HW_IF_VELOCITY &&
         joint.name == gripper_joint_name_)
       {
+        // gripper velocity command interface -> hold-to-move (GRIPPER_SPEED) controller
+        stop_modes_.emplace_back(StopStartInterface::STOP_GRIPPER_VEL);
         continue;
       }
       if (key == joint.name + "/" + hardware_interface::HW_IF_POSITION)
@@ -485,6 +495,8 @@ return_type KortexMultiInterfaceHardware::prepare_command_mode_switch(
         key == joint.name + "/" + hardware_interface::HW_IF_VELOCITY &&
         joint.name == gripper_joint_name_)
       {
+        // gripper velocity command interface -> hold-to-move (GRIPPER_SPEED) controller
+        start_modes_.emplace_back(StopStartInterface::START_GRIPPER_VEL);
         continue;
       }
       if (key == joint.name + "/" + hardware_interface::HW_IF_POSITION)
@@ -541,6 +553,13 @@ return_type KortexMultiInterfaceHardware::prepare_command_mode_switch(
   }
   if (
     !stop_modes_.empty() &&
+    std::find(stop_modes_.begin(), stop_modes_.end(), StopStartInterface::STOP_GRIPPER_VEL) !=
+      stop_modes_.end())
+  {
+    stop_gripper_vel_controller_ = true;
+  }
+  if (
+    !stop_modes_.empty() &&
     std::find(stop_modes_.begin(), stop_modes_.end(), StopStartInterface::STOP_FAULT_CTRL) !=
       stop_modes_.end())
   {
@@ -570,6 +589,13 @@ return_type KortexMultiInterfaceHardware::prepare_command_mode_switch(
   }
   if (
     !start_modes_.empty() &&
+    (std::find(start_modes_.begin(), start_modes_.end(), StopStartInterface::START_GRIPPER_VEL) !=
+     start_modes_.end()))
+  {
+    start_gripper_vel_controller_ = true;
+  }
+  if (
+    !start_modes_.empty() &&
     (std::find(start_modes_.begin(), start_modes_.end(), StopStartInterface::START_FAULT_CTRL) !=
      start_modes_.end()))
   {
@@ -585,6 +611,22 @@ return_type KortexMultiInterfaceHardware::prepare_command_mode_switch(
   if (joint_based_controller_running_ && start_twist_controller_ && !stop_joint_based_controller_)
   {
     RCLCPP_ERROR(LOGGER, "Can't start twist controller while joint based controller is running!");
+    return hardware_interface::return_type::ERROR;
+  }
+
+  // handle exclusiveness between the position (action) and velocity (hold-to-move)
+  // gripper controllers - they both drive the same physical gripper, so only one
+  // may claim it at a time.
+  if (gripper_controller_running_ && start_gripper_vel_controller_ && !stop_gripper_controller_)
+  {
+    RCLCPP_ERROR(
+      LOGGER, "Can't start gripper velocity controller while gripper (position) controller runs!");
+    return hardware_interface::return_type::ERROR;
+  }
+  if (gripper_vel_controller_running_ && start_gripper_controller_ && !stop_gripper_vel_controller_)
+  {
+    RCLCPP_ERROR(
+      LOGGER, "Can't start gripper (position) controller while gripper velocity controller runs!");
     return hardware_interface::return_type::ERROR;
   }
 
@@ -611,6 +653,12 @@ return_type KortexMultiInterfaceHardware::perform_command_mode_switch(
   {
     gripper_controller_running_ = false;
     gripper_command_position_ = gripper_position_;
+  }
+  if (stop_gripper_vel_controller_)
+  {
+    gripper_vel_controller_running_ = false;
+    gripper_velocity_command_ = 0.0;
+    gripper_motion_active_ = false;
   }
   if (stop_fault_controller_)
   {
@@ -643,6 +691,12 @@ return_type KortexMultiInterfaceHardware::perform_command_mode_switch(
     gripper_command_position_ = gripper_position_;
     gripper_controller_running_ = true;
   }
+  if (start_gripper_vel_controller_)
+  {
+    gripper_velocity_command_ = 0.0;
+    gripper_motion_active_ = false;
+    gripper_vel_controller_running_ = true;
+  }
   if (start_fault_controller_)
   {
     fault_controller_running_ = true;
@@ -650,9 +704,9 @@ return_type KortexMultiInterfaceHardware::perform_command_mode_switch(
 
   // reset auxiliary switching booleans
   stop_joint_based_controller_ = stop_twist_controller_ = stop_fault_controller_ =
-    stop_gripper_controller_ = false;
+    stop_gripper_controller_ = stop_gripper_vel_controller_ = false;
   start_joint_based_controller_ = start_twist_controller_ = start_fault_controller_ =
-    start_gripper_controller_ = false;
+    start_gripper_controller_ = start_gripper_vel_controller_ = false;
 
   start_modes_.clear();
   stop_modes_.clear();
@@ -798,8 +852,15 @@ return_type KortexMultiInterfaceHardware::read(
   // TODO(livanov93): separate warnings into another variable to expose it via fault controller
   //     + feedback_.base().warning_bank_a() + feedback_.base().warning_bank_b());
 
-  // add mode that can't be easily reached
-  in_fault_ += (feedback_.base().active_state() == k_api::Common::ARMSTATE_SERVOING_READY);
+  // NOTE: ARMSTATE_SERVOING_READY is the NORMAL idle state of high-level
+  // (SINGLE_LEVEL_SERVOING) mode, which twist teleop uses. Upstream added it to the
+  // fault sum, but combined with the `if (in_fault_ == 0.0)` gate in write() it
+  // freezes ALL twist/gripper commands whenever the arm idles in high-level mode
+  // (no real fault — the Kinova Web App shows none). This bit the teleop stack once
+  // the continuous zero-twist heartbeat stopped being sent every cycle. Do NOT treat
+  // it as a fault; real faults are still caught above via ARMSTATE_IN_FAULT and the
+  // actuator/base fault banks.
+  // in_fault_ += (feedback_.base().active_state() == k_api::Common::ARMSTATE_SERVOING_READY);
 
   return return_type::OK;
 }
@@ -868,21 +929,86 @@ return_type KortexMultiInterfaceHardware::write(
   {
     if (arm_mode_ == k_api::Base::ServoingMode::SINGLE_LEVEL_SERVOING)
     {
-      // Twist controller active
-      if (twist_controller_running_)
+      // In high-level (SINGLE_LEVEL_SERVOING) mode SendTwistCommand and
+      // SendGripperCommand are mutually-exclusive high-level motions: whichever is
+      // issued last preempts the other. To get joystick-like behaviour we never
+      // issue both in the same cycle - exactly ONE high-level TCP RPC goes out per
+      // write(), which also keeps the twist command rate up (no double round-trip).
+      if (gripper_vel_controller_running_)
       {
-        // twist control
-        sendTwistCommand();
+        // ---- Hold-to-move gripper teleop (GRIPPER_SPEED) ----
+        // Only actuate the gripper while the arm is being held still, mirroring the
+        // Kinova pendant where the gripper cannot move while the arm moves.
+        // Twist has no firmware watchdog (duration=0), so the zero (stop) twist must
+        // be delivered to halt the arm before the gripper may own the shared bus -
+        // otherwise releasing the clutch while squeezing a trigger leaves the arm
+        // gliding at the last non-zero twist. Send twist while non-zero and once more
+        // when it returns to zero (latched), only then let the gripper move.
+        const bool twist_zero = twistIsZero();
+        const bool deliver_twist = twist_controller_running_ && !(twist_zero && twist_stopped_);
+        const bool want_grip = !std::isnan(gripper_velocity_command_) &&
+                               (std::abs(gripper_velocity_command_) > GRIPPER_VEL_DEADBAND) &&
+                               twist_zero && !deliver_twist;
+        if (deliver_twist)
+        {
+          // Stop the fingers exactly once if they were moving (2F-85 self-locks),
+          // then send the twist / its stop. Both RPCs can't go out the same cycle.
+          if (gripper_motion_active_)
+          {
+            sendGripperSpeed(0.0);
+            gripper_motion_active_ = false;
+          }
+          sendTwistCommand();
+          twist_stopped_ = twist_zero;
+        }
+        else if (want_grip)
+        {
+          // Gripper owns the bus this cycle; suppress twist to avoid preemption.
+          sendGripperSpeed(gripper_velocity_command_);
+          gripper_motion_active_ = true;
+        }
+        else if (gripper_motion_active_)
+        {
+          // Button released (or the arm just started moving): stop the fingers
+          // exactly once. The 2F-85 is self-locking, so it holds its position.
+          sendGripperSpeed(0.0);
+          gripper_motion_active_ = false;
+        }
       }
       else
       {
-        // Keep alive mode - no controller active
-        RCLCPP_DEBUG(LOGGER, "No controller active in SINGLE_LEVEL_SERVOING mode!");
+        // ---- Position-goal gripper (action / forward position controller) ----
+        // High-level twist and gripper go-to are firmware-mutually-exclusive, so
+        // exactly like the velocity branch above we emit at most ONE high-level RPC
+        // per cycle: the gripper owns the bus only while the arm is held still,
+        // otherwise twist does. This prevents the two RPCs from preempting each
+        // other every cycle (which is what made the gripper shaky in twist mode).
+        // No explicit "stop" is needed on hand-off: a go-to is a target and the
+        // 2F-85 self-locks, so when twist preempts it the fingers just hold, and we
+        // re-issue the same go-to on the next zero-twist cycle to resume.
+        // High-level twist persists in firmware (duration=0) until a new twist
+        // arrives, so the zero (stop) twist must actually be sent to halt the arm -
+        // we cannot just hand the bus to a gripper go-to, or the arm keeps gliding
+        // at the last non-zero twist. Send twist while it is non-zero, and once more
+        // when it returns to zero (latched by twist_stopped_); only then may a
+        // pending gripper go-to own the bus.
+        const bool twist_zero = twistIsZero();
+        if (twist_controller_running_ && !(twist_zero && twist_stopped_))
+        {
+          sendTwistCommand();
+          twist_stopped_ = twist_zero;
+        }
+        else if (gripper_controller_running_ && !std::isnan(gripper_command_position_))
+        {
+          sendGripperCommand(
+            arm_mode_, gripper_command_position_, gripper_speed_command_, gripper_force_command_);
+        }
+        else
+        {
+          // Keep alive mode - no controller active
+          RCLCPP_DEBUG(LOGGER, "No controller active in SINGLE_LEVEL_SERVOING mode!");
+        }
       }
-
-      // gripper control
-      sendGripperCommand(
-        arm_mode_, gripper_command_position_, gripper_speed_command_, gripper_force_command_);
       // read after write in twist mode
       feedback_ = base_cyclic_.RefreshFeedback();
     }
@@ -1025,6 +1151,86 @@ void KortexMultiInterfaceHardware::sendGripperCommand(
         LOGGER, "Error sub-code: " << k_api::SubErrorCodes_Name(
                   k_api::SubErrorCodes((ex.getErrorInfo().getError().error_sub_code()))));
     }
+    // The pre-existing catch above only handles KDetailedException, but Kortex
+    // throws std::runtime_error on TCP RPC timeouts (the dominant failure mode
+    // in SINGLE_LEVEL_SERVOING mode, where SendGripperCommand goes over the
+    // slow high-level API). Without these catches, a single gripper RPC timeout
+    // killed the whole ros2_control_node. Throttled to 1 Hz so flapping
+    // connections don't spam.
+    catch (std::runtime_error & ex_runtime)
+    {
+      static rclcpp::Clock throttle_clock;
+      RCLCPP_ERROR_STREAM_THROTTLE(
+        LOGGER, throttle_clock, 1000,
+        "SendGripperCommand failed (runtime_error): " << ex_runtime.what());
+    }
+    catch (std::future_error & ex_future)
+    {
+      static rclcpp::Clock throttle_clock;
+      RCLCPP_ERROR_STREAM_THROTTLE(
+        LOGGER, throttle_clock, 1000,
+        "SendGripperCommand failed (future_error): " << ex_future.what());
+    }
+    catch (std::exception & ex_std)
+    {
+      static rclcpp::Clock throttle_clock;
+      RCLCPP_ERROR_STREAM_THROTTLE(
+        LOGGER, throttle_clock, 1000,
+        "SendGripperCommand failed: " << ex_std.what());
+    }
+  }
+}
+
+bool KortexMultiInterfaceHardware::twistIsZero() const
+{
+  for (const double v : twist_commands_)
+  {
+    if (std::abs(v) > TWIST_ZERO_EPS)
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+void KortexMultiInterfaceHardware::sendGripperSpeed(double speed)
+{
+  if (!use_internal_bus_gripper_comm_)
+  {
+    return;
+  }
+  static rclcpp::Clock throttle_clock;
+  try
+  {
+    // GRIPPER_SPEED: the finger value is the signed speed in [-1, 1]. Kinova's
+    // firmware uses positive = OPENING, but the rest of this driver follows the
+    // ROS joint convention where the gripper position increases as it closes
+    // (0 = open, 0.81 = closed). Negate here so this hardware's "velocity" command
+    // interface is the proper time-derivative of its position interface:
+    // positive velocity = position increasing = closing. (Same boundary-conversion
+    // rationale as the rad/s -> deg/s twist conversion in sendTwistCommand.)
+    k_api::Base::GripperCommand gripper_command;
+    gripper_command.set_mode(k_api::Base::GRIPPER_SPEED);
+    auto finger = gripper_command.mutable_gripper()->add_finger();
+    finger->set_finger_identifier(1);
+    finger->set_value(static_cast<float>(-std::clamp(speed, -1.0, 1.0)));
+    base_.SendGripperCommand(gripper_command);
+  }
+  // Same rationale as sendGripperCommand()/sendTwistCommand(): a single TCP RPC
+  // timeout must not tear down the whole ros2_control_node. Logging is throttled.
+  catch (k_api::KDetailedException & ex)
+  {
+    RCLCPP_ERROR_STREAM_THROTTLE(
+      LOGGER, throttle_clock, 1000,
+      "SendGripperCommand (speed) failed (Kortex): "
+        << ex.what() << "; sub-code: "
+        << k_api::SubErrorCodes_Name(
+             k_api::SubErrorCodes((ex.getErrorInfo().getError().error_sub_code()))));
+  }
+  catch (std::exception & ex_std)
+  {
+    RCLCPP_ERROR_STREAM_THROTTLE(
+      LOGGER, throttle_clock, 1000, "SendGripperCommand (speed) failed: " << ex_std.what());
   }
 }
 
@@ -1040,7 +1246,46 @@ void KortexMultiInterfaceHardware::sendTwistCommand()
   k_api_twist_->set_angular_x(static_cast<float>(KortexMathUtil::toDeg(twist_commands_[3])));
   k_api_twist_->set_angular_y(static_cast<float>(KortexMathUtil::toDeg(twist_commands_[4])));
   k_api_twist_->set_angular_z(static_cast<float>(KortexMathUtil::toDeg(twist_commands_[5])));
-  base_.SendTwistCommand(k_api_twist_command_);
+
+  // Safety: in SINGLE_LEVEL_SERVOING mode every controller_manager write cycle
+  // (1 kHz) issues a TCP RPC to Kortex. A single timeout used to throw out of
+  // write() and kill the whole ros2_control_node — which left the arm
+  // executing the last twist forever (no command timeout in
+  // picknik_twist_controller). Catching here keeps the node alive; combined
+  // with k_api_twist_command_.set_duration(...) set in on_activate, Kortex
+  // itself decelerates the arm after the duration window if no fresh command
+  // arrives. Logging is THROTTLED so a flapping connection doesn't spam.
+  static rclcpp::Clock throttle_clock;
+  try
+  {
+    base_.SendTwistCommand(k_api_twist_command_);
+  }
+  catch (k_api::KDetailedException & ex)
+  {
+    RCLCPP_ERROR_STREAM_THROTTLE(
+      LOGGER, throttle_clock, 1000,
+      "SendTwistCommand failed (Kortex): " << ex.what() << "; sub-code: "
+        << k_api::SubErrorCodes_Name(
+             k_api::SubErrorCodes((ex.getErrorInfo().getError().error_sub_code()))));
+  }
+  catch (std::runtime_error & ex_runtime)
+  {
+    RCLCPP_ERROR_STREAM_THROTTLE(
+      LOGGER, throttle_clock, 1000,
+      "SendTwistCommand failed (runtime_error): " << ex_runtime.what());
+  }
+  catch (std::future_error & ex_future)
+  {
+    RCLCPP_ERROR_STREAM_THROTTLE(
+      LOGGER, throttle_clock, 1000,
+      "SendTwistCommand failed (future_error): " << ex_future.what());
+  }
+  catch (std::exception & ex_std)
+  {
+    RCLCPP_ERROR_STREAM_THROTTLE(
+      LOGGER, throttle_clock, 1000,
+      "SendTwistCommand failed: " << ex_std.what());
+  }
 }
 
 }  // namespace kortex_driver
