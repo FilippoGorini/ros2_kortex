@@ -141,6 +141,11 @@ private:
   std::vector<double> arm_velocities_;
   std::vector<double> arm_efforts_;
 
+  std::vector<double> arm_prev_wrapped_;
+  std::vector<double> arm_positions_cont_;
+  bool unwrap_seeded_ = false;
+  bool unwrap_joint_states_ = false;
+
   // twist command interfaces
   std::vector<double> twist_commands_;
 

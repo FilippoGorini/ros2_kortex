@@ -254,6 +254,9 @@ CallbackReturn KortexMultiInterfaceHardware::on_init(const hardware_interface::H
   RCLCPP_INFO(LOGGER, "Actuator count reported by robot is '%lu'", actuator_count_);
 
   arm_positions_.resize(actuator_count_, std::numeric_limits<double>::quiet_NaN());
+  arm_prev_wrapped_.resize(actuator_count_, 0.0);     // holds the last wrapped positions received from the firmware
+  arm_positions_cont_.resize(actuator_count_, 0.0);   // holds the continuous unwrapped positions after unwrapping
+  unwrap_seeded_ = false;
   arm_velocities_.resize(actuator_count_, std::numeric_limits<double>::quiet_NaN());
   arm_efforts_.resize(actuator_count_, std::numeric_limits<double>::quiet_NaN());
   arm_commands_positions_.resize(actuator_count_, std::numeric_limits<double>::quiet_NaN());
@@ -298,6 +301,18 @@ CallbackReturn KortexMultiInterfaceHardware::on_init(const hardware_interface::H
   {
     use_internal_bus_gripper_comm_ = true;
     RCLCPP_INFO(LOGGER, "Using internal bus communication for gripper!");
+  }
+
+  if (
+    (info_.hardware_parameters["unwrap_joint_states"] == "true") ||
+    (info_.hardware_parameters["unwrap_joint_states"] == "True"))
+  {
+    unwrap_joint_states_ = true;
+    RCLCPP_INFO(LOGGER, "Publishing continuous (unwrapped) joint positions.");
+  }
+  else
+  {
+    RCLCPP_INFO(LOGGER, "Publishing stock wrapped [-pi, pi] joint positions.");
   }
 
   RCLCPP_INFO(LOGGER, "Hardware Interface successfully configured");
@@ -726,6 +741,9 @@ CallbackReturn KortexMultiInterfaceHardware::on_activate(
   const rclcpp_lifecycle::State & /* previous_state */)
 {
   RCLCPP_INFO(LOGGER, "Activating KortexMultiInterfaceHardware...");
+  // Re-anchor the continuous-position accumulator: the next read() re-seeds it to the
+  // current (wrapped) pose, so the multi-turn count restarts from this activation
+  unwrap_seeded_ = false;
   // first read
   auto base_feedback = base_cyclic_.RefreshFeedback();
 
@@ -841,16 +859,44 @@ return_type KortexMultiInterfaceHardware::read(
     // read velocity
     arm_velocities_[i] = KortexMathUtil::toRad(feedback_.actuators(i).velocity());  // rad/sec
     // read position
-    num_turns_tmp_ = 0;
-    arm_positions_[i] = KortexMathUtil::wrapRadiansFromMinusPiToPi(
-      KortexMathUtil::toRad(feedback_.actuators(i).position()),
-      num_turns_tmp_);  // rad
+    if (!unwrap_joint_states_)
+    {
+      // Stock behaviour: wrap to [-pi, pi]. This is what MoveIt and the closed-loop JTC expect, so it stays the default for normal robot operation
+      num_turns_tmp_ = 0;
+      arm_positions_[i] = KortexMathUtil::wrapRadiansFromMinusPiToPi(
+        KortexMathUtil::toRad(feedback_.actuators(i).position()),
+        num_turns_tmp_);  // rad
+    }
+    else
+    {
+      // Alternatively publish a multi-turn-continuous value. The firmware reports only a
+      // single-turn angle, so wrapping it folds joint_states at +-pi. 
+      // We integrate the per-sample increment so a joint driven past +-pi doesn't wrap around producing a 2pi discontinuity in the joint state
+      // Seeded to the wrapped value read on the first pass after (re)activation
+      const double w = KortexMathUtil::wrapRadiansFromMinusPiToPi(
+        KortexMathUtil::toRad(feedback_.actuators(i).position()));  // [-pi, pi], rad
+      if (!unwrap_seeded_)
+      {
+        arm_positions_cont_[i] = w;
+      }
+      else
+      {
+        double d = w - arm_prev_wrapped_[i];
+        if (d > M_PI) d -= 2.0 * M_PI;    // came up through +pi (firmware wrapped down)
+        if (d < -M_PI) d += 2.0 * M_PI;   // came down through -pi (firmware wrapped up)
+        arm_positions_cont_[i] += d;
+      }
+      arm_prev_wrapped_[i] = w;
+      arm_positions_[i] = arm_positions_cont_[i];  // rad, continuous
+    }
 
     in_fault_ += (feedback_.actuators(i).fault_bank_a() + feedback_.actuators(i).fault_bank_b());
 
     // TODO(livanov93): separate warnings into another variable to expose it via fault controller
     //       feedback_.actuators(i).warning_bank_a() + feedback_.actuators(i).warning_bank_b());
   }
+  // All joints now have a valid wrapped baseline in arm_prev_wrapped_; start integrating.
+  unwrap_seeded_ = true;
 
   // add all base's faults and warnings into series
   in_fault_ += (feedback_.base().fault_bank_a() + feedback_.base().fault_bank_b());
