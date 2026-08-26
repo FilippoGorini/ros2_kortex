@@ -235,6 +235,11 @@ private:
   static constexpr double NO_CMD = std::numeric_limits<double>::quiet_NaN();
 
   void sendTwistCommand();
+
+  bool tryRefreshFeedback();
+
+  void sendZeroTwist();
+
   void incrementId();
   void sendJointCommands();
   void prepareCommands();

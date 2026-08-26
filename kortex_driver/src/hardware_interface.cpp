@@ -39,6 +39,12 @@
 namespace
 {
 const rclcpp::Logger LOGGER = rclcpp::get_logger("KortexMultiInterfaceHardware");
+
+// Kortex RPCs default to a 3000 ms blocking timeout ({false, 0, 3000}), so a
+// single lost/late reply stalls the 1 kHz write loop for a full 3 s and the arm keeps moving with the last commanded twist
+// With this smaller timeout a lost reply fails faster and the loop can reattempt the stop much faster
+//  The startup RPCs in on_activate() intentionally keep the 3 s default.
+const k_api::RouterClientSendOptions kRtSendOptions{false, 0, 100};
 }
 
 namespace kortex_driver
@@ -675,7 +681,7 @@ return_type KortexMultiInterfaceHardware::perform_command_mode_switch(
     arm_commands_velocities_ = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
     joint_based_controller_running_ = true;
     // refresh feedback
-    feedback_ = base_cyclic_.RefreshFeedback();
+    tryRefreshFeedback();
   }
   if (start_twist_controller_)
   {
@@ -819,7 +825,7 @@ return_type KortexMultiInterfaceHardware::read(
   if (first_pass_)
   {
     first_pass_ = false;
-    feedback_ = base_cyclic_.RefreshFeedback();
+    tryRefreshFeedback();
   }
 
   // read if robot is faulted
@@ -882,7 +888,7 @@ return_type KortexMultiInterfaceHardware::write(
 {
   if (block_write)
   {
-    feedback_ = base_cyclic_.RefreshFeedback();
+    tryRefreshFeedback();
     return return_type::OK;
   }
 
@@ -1010,7 +1016,11 @@ return_type KortexMultiInterfaceHardware::write(
         }
       }
       // read after write in twist mode
-      feedback_ = base_cyclic_.RefreshFeedback();
+      if (!tryRefreshFeedback())
+      {
+        // Feedback timed out (now 100 ms instead of 3000) push a zero twist to try stopping the robot
+        sendZeroTwist();
+      }
     }
     else if (
       (arm_mode_ == k_api::Base::ServoingMode::LOW_LEVEL_SERVOING) &&
@@ -1030,14 +1040,14 @@ return_type KortexMultiInterfaceHardware::write(
       else
       {
         // Keep alive mode - no controller active
-        feedback_ = base_cyclic_.RefreshFeedback();
+        tryRefreshFeedback();
         RCLCPP_DEBUG(LOGGER, "No controller active in LOW_LEVEL_SERVOING mode !");
       }
     }
     else
     {
       // Keep alive mode - no controller active
-      feedback_ = base_cyclic_.RefreshFeedback();
+      tryRefreshFeedback();
       RCLCPP_DEBUG(
         LOGGER,
         "Fault was not recognized on the robot but combination of Control Mode and Active State "
@@ -1048,7 +1058,7 @@ return_type KortexMultiInterfaceHardware::write(
   {
     // this is needed when the robot was faulted
     // so we can internally conclude it is not faulted anymore
-    feedback_ = base_cyclic_.RefreshFeedback();
+    tryRefreshFeedback();
   }
 
   return return_type::OK;
@@ -1080,11 +1090,11 @@ void KortexMultiInterfaceHardware::sendJointCommands()
   // send the command to the robot
   try
   {
-    feedback_ = base_cyclic_.Refresh(base_command_);
+    feedback_ = base_cyclic_.Refresh(base_command_, 0, kRtSendOptions);
   }
   catch (k_api::KDetailedException & ex)
   {
-    feedback_ = base_cyclic_.RefreshFeedback();
+    tryRefreshFeedback();
     RCLCPP_ERROR_STREAM(LOGGER, "Kortex exception: " << ex.what());
 
     RCLCPP_ERROR_STREAM(
@@ -1093,17 +1103,17 @@ void KortexMultiInterfaceHardware::sendJointCommands()
   }
   catch (std::runtime_error & ex_runtime)
   {
-    feedback_ = base_cyclic_.RefreshFeedback();
+    tryRefreshFeedback();
     RCLCPP_ERROR_STREAM(LOGGER, "Runtime error: " << ex_runtime.what());
   }
   catch (std::future_error & ex_future)
   {
-    feedback_ = base_cyclic_.RefreshFeedback();
+    tryRefreshFeedback();
     RCLCPP_ERROR_STREAM(LOGGER, "Future error: " << ex_future.what());
   }
   catch (std::exception & ex_std)
   {
-    feedback_ = base_cyclic_.RefreshFeedback();
+    tryRefreshFeedback();
     RCLCPP_ERROR_STREAM(LOGGER, "Standard exception: " << ex_std.what());
   }
 }
@@ -1130,7 +1140,7 @@ void KortexMultiInterfaceHardware::sendGripperCommand(
         finger->set_finger_identifier(1);
         finger->set_value(
           static_cast<float>(position / 0.81));  // This values needs to be between 0 and 1
-        base_.SendGripperCommand(gripper_command);
+        base_.SendGripperCommand(gripper_command, 0, kRtSendOptions);
       }
       else if (arm_mode == k_api::Base::ServoingMode::LOW_LEVEL_SERVOING)
       {
@@ -1214,7 +1224,7 @@ void KortexMultiInterfaceHardware::sendGripperSpeed(double speed)
     auto finger = gripper_command.mutable_gripper()->add_finger();
     finger->set_finger_identifier(1);
     finger->set_value(static_cast<float>(-std::clamp(speed, -1.0, 1.0)));
-    base_.SendGripperCommand(gripper_command);
+    base_.SendGripperCommand(gripper_command, 0, kRtSendOptions);
   }
   // Same rationale as sendGripperCommand()/sendTwistCommand(): a single TCP RPC
   // timeout must not tear down the whole ros2_control_node. Logging is throttled.
@@ -1231,6 +1241,68 @@ void KortexMultiInterfaceHardware::sendGripperSpeed(double speed)
   {
     RCLCPP_ERROR_STREAM_THROTTLE(
       LOGGER, throttle_clock, 1000, "SendGripperCommand (speed) failed: " << ex_std.what());
+  }
+}
+
+bool KortexMultiInterfaceHardware::tryRefreshFeedback()
+{
+  // Guarded cyclic feedback read. Kortex throws std::runtime_error
+  // ("timeout detected: BaseCyclicClient::RefreshFeedback") when a feedback
+  // packet is late/lost. These reads used to be unguarded, so a single timeout
+  // propagated out of read()/write() and aborted the whole ros2_control_node
+  // which, in high-level twist mode (no firmware watchdog), left the arm gliding
+  // at its last twist. Catch instead and keep the last-known feedback_ so the
+  // caller can react (see sendZeroTwist)
+  static rclcpp::Clock throttle_clock;
+  try
+  {
+    feedback_ = base_cyclic_.RefreshFeedback(0, kRtSendOptions);
+    return true;
+  }
+  catch (k_api::KDetailedException & ex)
+  {
+    RCLCPP_ERROR_STREAM_THROTTLE(
+      LOGGER, throttle_clock, 1000, "RefreshFeedback failed (Kortex): " << ex.what());
+  }
+  catch (std::exception & ex)
+  {
+    RCLCPP_ERROR_STREAM_THROTTLE(
+      LOGGER, throttle_clock, 1000, "RefreshFeedback failed: " << ex.what());
+  }
+  return false;
+}
+
+void KortexMultiInterfaceHardware::sendZeroTwist()
+{
+  // Best-effort halt for high-level twist mode. The Kortex TwistCommand duration
+  // is unimplemented (stays 0), so there is NO firmware watchdog: the arm keeps
+  // executing the last non-zero twist until a new one arrives. When a feedback
+  // read times out we push an explicit zero twist so a lost cycle actively stops
+  // the arm. Guarded + throttled like sendTwistCommand(): if
+  // the link is fully down this is a no-op, but on an intermittent link the stop
+  // gets through as soon as one RPC makes it. sendTwistCommand() re-populates
+  // every component from twist_commands_, so zeroing here leaves no residue.
+  k_api_twist_->set_linear_x(0.0f);
+  k_api_twist_->set_linear_y(0.0f);
+  k_api_twist_->set_linear_z(0.0f);
+  k_api_twist_->set_angular_x(0.0f);
+  k_api_twist_->set_angular_y(0.0f);
+  k_api_twist_->set_angular_z(0.0f);
+
+  static rclcpp::Clock throttle_clock;
+  try
+  {
+    base_.SendTwistCommand(k_api_twist_command_, 0, kRtSendOptions);
+  }
+  catch (k_api::KDetailedException & ex)
+  {
+    RCLCPP_ERROR_STREAM_THROTTLE(
+      LOGGER, throttle_clock, 1000, "sendZeroTwist failed (Kortex): " << ex.what());
+  }
+  catch (std::exception & ex)
+  {
+    RCLCPP_ERROR_STREAM_THROTTLE(
+      LOGGER, throttle_clock, 1000, "sendZeroTwist failed: " << ex.what());
   }
 }
 
@@ -1258,7 +1330,7 @@ void KortexMultiInterfaceHardware::sendTwistCommand()
   static rclcpp::Clock throttle_clock;
   try
   {
-    base_.SendTwistCommand(k_api_twist_command_);
+    base_.SendTwistCommand(k_api_twist_command_, 0, kRtSendOptions);
   }
   catch (k_api::KDetailedException & ex)
   {
